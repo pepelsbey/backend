@@ -92,7 +92,7 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     healthcheck:
-      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost:80"]
+      test: ["CMD-SHELL", "wget -qO /dev/null http://localhost:2019/ 2>/dev/null"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -192,6 +192,30 @@ www.$domain {
 	redir https://$domain{uri} permanent
 }
 SITE_CADDYFILE_EOF
+}
+
+generate_deploy_shell() {
+	cat << 'DEPLOY_SHELL_EOF'
+#!/bin/bash
+set -euo pipefail
+
+# Restricted shell for the deploy user.
+# Only allows rsync in server mode; interactive login is denied.
+# File-system permissions ensure writes only reach public/ directories.
+
+if [[ -z "${SSH_ORIGINAL_COMMAND:-}" ]]; then
+	echo "Interactive login is disabled for this account."
+	echo "Use rsync to deploy content to /opt/sites/<domain>/public/"
+	exit 1
+fi
+
+if [[ "$SSH_ORIGINAL_COMMAND" == rsync\ --server* ]]; then
+	exec $SSH_ORIGINAL_COMMAND
+fi
+
+echo "Only rsync is permitted for this account."
+exit 1
+DEPLOY_SHELL_EOF
 }
 
 #-------------------------------------------------------------------------------
@@ -646,6 +670,7 @@ do_initial_setup() {
 		curl \
 		gnupg \
 		lsb-release \
+		rsync \
 		ufw \
 		unattended-upgrades \
 		apt-listchanges
@@ -725,6 +750,13 @@ ClientAliveCountMax 2
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 KexAlgorithms curve25519-sha256@libssh.org,curve25519-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+
+# Restrict deploy user to rsync only via forced command
+Match User deploy
+	ForceCommand /usr/local/bin/deploy-shell
+	AllowTcpForwarding no
+	PermitTunnel no
+	AllowAgentForwarding no
 EOF
 
 	mkdir -p /run/sshd
@@ -786,6 +818,11 @@ EOF
 	else
 		log_info "Deploy user already exists"
 	fi
+
+	# Install restricted shell for deploy user (rsync-only)
+	generate_deploy_shell > /usr/local/bin/deploy-shell
+	chmod 755 /usr/local/bin/deploy-shell
+	chown root:root /usr/local/bin/deploy-shell
 
 	# Create symlink for global 'setup' command (root only)
 	ln -sf "$CONFIG_DIR/setup.sh" /usr/local/bin/setup
