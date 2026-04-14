@@ -16,6 +16,7 @@
 #   setup reload           # Reload Caddy config
 #   setup restart          # Restart Caddy container
 #   setup update caddy     # Update Caddy image
+#   setup update caddyfile # Update global Caddyfile
 #   setup update setup     # Update this script
 #
 # Requirements:
@@ -543,7 +544,7 @@ cmd_update() {
 	local target="${1:-}"
 
 	if [[ -z "$target" ]]; then
-		log_error "Specify what to update: caddy or setup"
+		log_error "Specify what to update: caddy, caddyfile, or setup"
 		return 1
 	fi
 
@@ -577,6 +578,32 @@ cmd_update() {
 			log_success "Caddy updated to latest version"
 			docker ps --filter "name=caddy" --format "Image: {{.Image}}"
 			;;
+		caddyfile)
+			log_info "Regenerating global Caddyfile from template..."
+
+			generate_caddyfile > "$CONFIG_DIR/Caddyfile.new"
+			chmod 644 "$CONFIG_DIR/Caddyfile.new"
+			chown root:root "$CONFIG_DIR/Caddyfile.new"
+
+			if caddy_running; then
+				# Swap in new file, validate, roll back on failure
+				cp "$CONFIG_DIR/Caddyfile" "$CONFIG_DIR/Caddyfile.bak"
+				mv "$CONFIG_DIR/Caddyfile.new" "$CONFIG_DIR/Caddyfile"
+
+				if docker exec caddy caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
+					docker exec caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
+					rm -f "$CONFIG_DIR/Caddyfile.bak"
+					log_success "Global Caddyfile updated and Caddy reloaded"
+				else
+					mv "$CONFIG_DIR/Caddyfile.bak" "$CONFIG_DIR/Caddyfile"
+					log_error "New Caddyfile validation failed — rolled back to previous config"
+					return 1
+				fi
+			else
+				mv "$CONFIG_DIR/Caddyfile.new" "$CONFIG_DIR/Caddyfile"
+				log_success "Global Caddyfile updated (Caddy not running — start it to apply)"
+			fi
+			;;
 		setup)
 			log_info "Updating setup script from GitHub..."
 
@@ -606,7 +633,7 @@ cmd_update() {
 			fi
 			;;
 		*)
-			log_error "Unknown update target: $target (use 'caddy' or 'setup')"
+			log_error "Unknown update target: $target (use 'caddy', 'caddyfile', or 'setup')"
 			return 1
 			;;
 	esac
@@ -978,7 +1005,8 @@ show_menu() {
 		echo "  6) Reload Caddy config"
 		echo "  7) Restart Caddy container"
 		echo "  8) Update Caddy image"
-		echo "  9) Update setup script"
+		echo "  9) Update global Caddyfile"
+		echo " 10) Update setup script"
 		echo "  s) Check SSL certificates"
 		echo "  0) Exit"
 		echo ""
@@ -993,7 +1021,8 @@ show_menu() {
 			6) cmd_reload ;;
 			7) cmd_restart ;;
 			8) cmd_update caddy ;;
-			9) cmd_update setup ;;
+			9) cmd_update caddyfile ;;
+			10) cmd_update setup ;;
 			s|S) cmd_ssl_status ;;
 			0) exit 0 ;;
 			*) log_error "Invalid option" ;;
@@ -1020,6 +1049,7 @@ Commands:
   reload                 Reload Caddy config
   restart                Restart Caddy container
   update caddy           Update Caddy image
+  update caddyfile       Update global Caddyfile
   update setup           Update setup script
   ssl                    Check SSL certificates
   help                   Show help
