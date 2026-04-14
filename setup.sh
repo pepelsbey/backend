@@ -117,6 +117,7 @@ generate_caddyfile() {
 (common) {
 	file_server {
 		hide .*
+		index index.html index.xml
 		precompressed br gzip
 	}
 
@@ -133,9 +134,6 @@ generate_caddyfile() {
 		Cross-Origin-Opener-Policy "same-origin"
 		-Server
 	}
-
-	# Clean URLs
-	try_files {path} {path}.html {path}/index.html {path}/index.xml
 
 	# Cache static assets
 	@static {
