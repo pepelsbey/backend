@@ -93,7 +93,7 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO /dev/null http://localhost:2019/ 2>/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:2019/ > /dev/null 2>&1"]
       interval: 30s
       timeout: 10s
       retries: 3
