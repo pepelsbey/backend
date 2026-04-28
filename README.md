@@ -26,16 +26,11 @@ A multi-site static web server using Docker and Caddy.
 
 Create a new Ubuntu 24 server and add your SSH key during creation.
 
-### Step 2: Upload setup script
-
-```bash
-ssh root@YOUR_SERVER_IP "curl -O https://raw.githubusercontent.com/pepelsbey/backend/refs/heads/main/setup.sh"
-```
-
-### Step 3: Run server setup
+### Step 2: Run server setup
 
 ```bash
 ssh root@YOUR_SERVER_IP
+curl -O https://raw.githubusercontent.com/pepelsbey/backend/refs/heads/main/setup.sh
 bash setup.sh
 ```
 
@@ -47,7 +42,7 @@ The script will:
 - Create a deploy user (content deployment only)
 - Prompt you to add your first site
 
-### Step 4: Verify SSH access
+### Step 3: Verify SSH access
 
 Before closing the root session, open a new terminal and test:
 
@@ -55,15 +50,15 @@ Before closing the root session, open a new terminal and test:
 ssh root@YOUR_SERVER_IP
 ```
 
+### Step 4: Update DNS
+
+Point your domain's A record to your server IP.
+
 ### Step 5: Start the server
 
 ```bash
 cd /opt/config && docker compose up -d
 ```
-
-### Step 6: Update DNS
-
-Point your domain's A record to your server IP.
 
 ## Management commands
 
@@ -78,10 +73,11 @@ setup status       # Show server status
 setup logs         # View Caddy logs
 setup reload       # Reload Caddy config
 setup restart      # Restart Caddy container
-setup update caddy # Update Caddy image
-setup update setup # Update setup script
-setup ssl          # Check SSL certificates
-setup help         # Show help
+setup update caddy     # Update Caddy image
+setup update caddyfile # Update global Caddyfile
+setup update setup     # Update setup script
+setup ssl              # Check SSL certificates
+setup help             # Show help
 ```
 
 ## Deploying your site
