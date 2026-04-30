@@ -698,6 +698,7 @@ do_initial_setup() {
 		rsync \
 		ufw \
 		unattended-upgrades \
+		vnstat \
 		apt-listchanges
 
 	#---------------------------------------------------------------------------
