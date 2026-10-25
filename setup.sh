@@ -691,6 +691,7 @@ do_initial_setup() {
 	log_info "Installing essential packages..."
 	DEBIAN_FRONTEND=noninteractive apt-get install -y \
 		apt-transport-https \
+		bash-completion \
 		ca-certificates \
 		curl \
 		gnupg \
@@ -823,6 +824,27 @@ EOF
 
 	systemctl enable unattended-upgrades
 	log_success "Automatic updates configured"
+
+	#---------------------------------------------------------------------------
+	# Configure Shell
+	#---------------------------------------------------------------------------
+
+	log_info "Configuring shell history search..."
+
+	# Up/Down arrows search history by the typed prefix (both normal and
+	# application cursor key modes)
+	if ! grep -q "# setup.sh: history prefix search" /etc/inputrc 2>/dev/null; then
+		cat >> /etc/inputrc << 'EOF'
+
+# setup.sh: history prefix search
+"\e[A": history-search-backward
+"\e[B": history-search-forward
+"\eOA": history-search-backward
+"\eOB": history-search-forward
+EOF
+	fi
+
+	log_success "Shell history search configured"
 
 	#---------------------------------------------------------------------------
 	# Create Deploy User
