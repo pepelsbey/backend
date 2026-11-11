@@ -18,6 +18,8 @@
 #   setup update caddy     # Update Caddy image
 #   setup update caddyfile # Update global Caddyfile
 #   setup update setup     # Update this script
+#   setup upgrade          # Bring server configuration up to date
+#   setup upgrade --check  # Show pending configuration changes
 #
 # Requirements:
 #   - Ubuntu 22.04 or 24.04 LTS
@@ -29,6 +31,8 @@
 #
 # Directory Structure (owned by root):
 #   /opt/config            - Server configuration files
+#     /Caddyfile           - Global configuration (managed by this script)
+#     /Caddyfile.local     - Local additions for all sites (never overwritten)
 #   /opt/sites/<domain>    - Per-site directories
 #     /Caddyfile           - Site-specific configuration
 #     /public              - Site's public content (owned by deploy)
@@ -37,7 +41,9 @@
 set -euo pipefail
 
 # Cleanup temporary files on exit
+WORK_DIR="$(mktemp -d)"
 cleanup() {
+	rm -rf "$WORK_DIR" 2>/dev/null || true
 	rm -f "$CONFIG_DIR/setup.sh.new" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -67,19 +73,32 @@ log_header() { echo -e "\n${BOLD}${CYAN}$1${NC}\n"; }
 CONFIG_DIR="/opt/config"
 SITES_DIR="/opt/sites"
 SETUP_MARKER="$CONFIG_DIR/.setup_complete"
+VERSION_FILE="$CONFIG_DIR/.setup_version"
+CADDY_IMAGE="caddy:2-alpine"
 DEPLOY_USER="deploy"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_URL="https://raw.githubusercontent.com/pepelsbey/backend/refs/heads/main/setup.sh"
+
+# Version of the server configuration this script produces. Bump it whenever
+# a change needs 'setup upgrade' to reach existing servers. Servers set up
+# before versioning have no version file and count as version 0.
+SCHEMA_VERSION=1
+
+# Run state
+CHECK_ONLY=0     # 1 = report differences without changing anything
+FRESH_INSTALL=0  # 1 = initial setup of a new server
+DRIFT_COUNT=0
+STAMP="$(date +%Y%m%d-%H%M%S)"
 
 #-------------------------------------------------------------------------------
 # Embedded Configuration Files
 #-------------------------------------------------------------------------------
 
 generate_docker_compose() {
-	cat << 'DOCKER_COMPOSE_EOF'
+	cat << DOCKER_COMPOSE_EOF
 services:
   caddy:
-    image: caddy:2-alpine
+    image: ${CADDY_IMAGE}
     container_name: caddy
     restart: unless-stopped
     ports:
@@ -87,13 +106,13 @@ services:
       - "443:443"
       - "443:443/udp"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${CONFIG_DIR}:/etc/caddy:ro
       - /opt/sites:/opt/sites:ro
       - /var/log/caddy:/var/log/caddy
       - caddy_data:/data
       - caddy_config:/config
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:2019/ > /dev/null 2>&1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:2019/config/ > /dev/null 2>&1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -114,6 +133,9 @@ DOCKER_COMPOSE_EOF
 
 generate_caddyfile() {
 	cat << 'CADDYFILE_EOF'
+# Managed by setup.sh: this file is replaced by 'setup upgrade' and
+# 'setup update caddyfile'. Put your own changes in Caddyfile.local.
+
 # Common configuration snippet for all sites
 (common) {
 	file_server {
@@ -156,6 +178,9 @@ generate_caddyfile() {
 		}
 		format json
 	}
+
+	# Local additions for all sites
+	import /etc/caddy/Caddyfile.local
 }
 
 # Import all site configurations
@@ -163,9 +188,23 @@ import /opt/sites/*/Caddyfile
 CADDYFILE_EOF
 }
 
+generate_caddyfile_local() {
+	cat << 'CADDYFILE_LOCAL_EOF'
+# Local additions to the common configuration. Directives in this file apply
+# to every site, after the defaults from /opt/config/Caddyfile, and are never
+# overwritten by 'setup upgrade' or 'setup update caddyfile'.
+#
+# Examples:
+#
+# header X-Frame-Options "DENY"
+# header -Cross-Origin-Resource-Policy
+CADDYFILE_LOCAL_EOF
+}
+
 generate_site_caddyfile() {
 	local domain="$1"
 	local email="$2"
+	local www="${3:-yes}"
 	cat << SITE_CADDYFILE_EOF
 $domain {
 	root * /opt/sites/$domain/public
@@ -185,12 +224,17 @@ $domain {
 		}
 	}
 }
+SITE_CADDYFILE_EOF
+
+	if [[ "$www" == "yes" ]]; then
+		cat << SITE_WWW_EOF
 
 www.$domain {
 	tls $email
 	redir https://$domain{uri} permanent
 }
-SITE_CADDYFILE_EOF
+SITE_WWW_EOF
+	fi
 }
 
 generate_deploy_shell() {
@@ -215,6 +259,54 @@ fi
 echo "Only rsync is permitted for this account."
 exit 1
 DEPLOY_SHELL_EOF
+}
+
+generate_sshd_config() {
+	cat << 'SSHD_CONFIG_EOF'
+# SSH Hardening Configuration
+PasswordAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+X11Forwarding no
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+KexAlgorithms curve25519-sha256@libssh.org,curve25519-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+
+# Restrict deploy user to rsync only via forced command
+Match User deploy
+	ForceCommand /usr/local/bin/deploy-shell
+	AllowTcpForwarding no
+	PermitTunnel no
+	AllowAgentForwarding no
+SSHD_CONFIG_EOF
+}
+
+generate_auto_upgrades() {
+	cat << 'AUTO_UPGRADES_EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+AUTO_UPGRADES_EOF
+}
+
+generate_unattended_upgrades() {
+	cat << 'UNATTENDED_UPGRADES_EOF'
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}";
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+};
+
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+UNATTENDED_UPGRADES_EOF
 }
 
 #-------------------------------------------------------------------------------
@@ -279,6 +371,103 @@ caddy_running() {
 	[[ -n "$(docker ps -q --filter 'name=^caddy$' 2>/dev/null)" ]]
 }
 
+# Containers created by earlier versions mount the global Caddyfile as a single
+# file, which pins the file's inode: a replaced file is invisible to Caddy
+# until the container is recreated.
+caddy_legacy_mount() {
+	docker inspect caddy --format '{{range .Mounts}}{{println .Destination}}{{end}}' 2>/dev/null \
+		| grep -qx '/etc/caddy/Caddyfile'
+}
+
+# Validate the configuration files on disk in a throwaway container, so the
+# result doesn't depend on what the running container has mounted.
+caddy_validate() {
+	local output
+	if output="$(docker run --rm \
+		-v "$CONFIG_DIR:/etc/caddy:ro" \
+		-v "$SITES_DIR:/opt/sites:ro" \
+		-v /var/log/caddy:/var/log/caddy \
+		"$CADDY_IMAGE" caddy validate --config /etc/caddy/Caddyfile 2>&1)"; then
+		return 0
+	fi
+	echo "$output" >&2
+	return 1
+}
+
+caddy_reload() {
+	local output
+	if caddy_legacy_mount; then
+		log_warning "This container predates the current setup. Run '$SCRIPT_NAME upgrade' to bring it up to date."
+	fi
+	if output="$(docker exec caddy caddy reload --config /etc/caddy/Caddyfile 2>&1)"; then
+		return 0
+	fi
+	echo "$output" >&2
+	return 1
+}
+
+installed_version() {
+	if [[ -f "$VERSION_FILE" ]]; then
+		cat "$VERSION_FILE"
+	else
+		echo 0
+	fi
+}
+
+write_version() {
+	echo "$SCHEMA_VERSION" > "$VERSION_FILE"
+}
+
+upgrade_pending() {
+	is_setup_complete && [[ "$(installed_version)" -lt "$SCHEMA_VERSION" ]]
+}
+
+# Report a difference between the server and what this script would set up
+drift() {
+	DRIFT_COUNT=$((DRIFT_COUNT + 1))
+	echo -e "  ${YELLOW}•${NC} $1"
+}
+
+# Bring a generated file in line with its template.
+#   sync_file <path> <mode> <generator> [backup]
+# Returns 0 if the file was changed (or would be, in check mode) and 1 if it
+# was already current, so always call it from an 'if' or with '|| true'.
+# With 'backup', the previous file is kept as <path>.bak.<timestamp>.
+sync_file() {
+	local path="$1"
+	local mode="$2"
+	local generator="$3"
+	local backup="${4:-}"
+	local tmp="$WORK_DIR/sync_file.tmp"
+
+	"$generator" > "$tmp"
+
+	if [[ -f "$path" ]] && cmp -s "$tmp" "$path"; then
+		return 1
+	fi
+
+	if (( CHECK_ONLY )); then
+		if [[ -f "$path" ]]; then
+			drift "$path differs from the current template:"
+			diff -u --label current --label new "$path" "$tmp" | sed 's/^/      /' || true
+		else
+			drift "$path is missing"
+		fi
+		return 0
+	fi
+
+	if [[ -f "$path" && -n "$backup" ]]; then
+		cp -p "$path" "$path.bak.$STAMP"
+		log_info "Previous version saved as $path.bak.$STAMP"
+	fi
+
+	cat "$tmp" > "$path"
+	chmod "$mode" "$path"
+	chown root:root "$path"
+	log_success "Updated $path"
+	return 0
+}
+
 #-------------------------------------------------------------------------------
 # Site Management Functions
 #-------------------------------------------------------------------------------
@@ -289,8 +478,24 @@ cmd_add_site() {
 		exit 1
 	fi
 
-	local domain="${1:-}"
-	local email="${2:-}"
+	local domain=""
+	local email=""
+	local www=""
+	local arg
+
+	for arg in "$@"; do
+		case "$arg" in
+			--www) www="yes" ;;
+			--no-www) www="no" ;;
+			*)
+				if [[ -z "$domain" ]]; then
+					domain="$arg"
+				elif [[ -z "$email" ]]; then
+					email="$arg"
+				fi
+				;;
+		esac
+	done
 
 	# Interactive mode if arguments not provided
 	if [[ -z "$domain" ]]; then
@@ -330,13 +535,32 @@ cmd_add_site() {
 		return 1
 	fi
 
+	# The www redirect needs its own DNS record and certificate, so it's only
+	# the default for domains that look like an apex (example.com)
+	if [[ -z "$www" ]]; then
+		local www_default="no"
+		if [[ "$domain" =~ ^[^.]+\.[^.]+$ ]]; then
+			www_default="yes"
+		fi
+
+		www="$www_default"
+		if [[ -t 0 ]]; then
+			local answer=""
+			read -rp "Also redirect www.$domain to $domain? (y/n) [$www_default]: " answer || true
+			case "$answer" in
+				[Yy]*) www="yes" ;;
+				[Nn]*) www="no" ;;
+			esac
+		fi
+	fi
+
 	log_info "Creating site structure for: $domain"
 
 	# Create directories
 	mkdir -p "$site_dir/public"
 
 	# Create site-specific Caddyfile
-	generate_site_caddyfile "$domain" "$email" > "$site_dir/Caddyfile"
+	generate_site_caddyfile "$domain" "$email" "$www" > "$site_dir/Caddyfile"
 
 	# Set ownership: root owns site dir and Caddyfile, deploy only owns public/
 	chmod 755 "$site_dir"
@@ -357,7 +581,7 @@ cmd_add_site() {
 	echo "  1. Add your content to: $site_dir/public/"
 	echo "  2. Customize $site_dir/Caddyfile as needed"
 	if caddy_running; then
-		echo "  3. Reload Caddy: $SCRIPT_NAME restart"
+		echo "  3. Reload Caddy: $SCRIPT_NAME reload"
 	else
 		echo "  3. Start Caddy: cd $CONFIG_DIR && docker compose up -d"
 	fi
@@ -378,6 +602,12 @@ cmd_remove_site() {
 
 	if [[ -z "$domain" ]]; then
 		log_error "Domain name is required"
+		return 1
+	fi
+
+	# The domain becomes part of a path passed to rm -rf
+	if ! validate_domain "$domain"; then
+		log_error "Invalid domain name format: $domain"
 		return 1
 	fi
 
@@ -404,10 +634,10 @@ cmd_remove_site() {
 
 	if caddy_running; then
 		log_info "Reloading Caddy configuration..."
-		if docker exec caddy caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
-			docker exec caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
-		else
+		if ! caddy_validate; then
 			log_warning "Caddyfile validation failed — skipping reload"
+		elif ! caddy_reload; then
+			log_warning "Reload failed — Caddy is still running the previous configuration"
 		fi
 	fi
 
@@ -430,6 +660,11 @@ cmd_status() {
 	echo "Setup Status:"
 	if is_setup_complete; then
 		echo "  ✓ Server setup complete ($(cat "$SETUP_MARKER" 2>/dev/null || echo 'unknown date'))"
+		if upgrade_pending; then
+			echo "  ! Configuration version $(installed_version), current is $SCHEMA_VERSION — run: $SCRIPT_NAME upgrade"
+		else
+			echo "  ✓ Configuration version $(installed_version)"
+		fi
 	else
 		echo "  ✗ Server not yet set up"
 	fi
@@ -438,7 +673,7 @@ cmd_status() {
 	echo "Caddy Container:"
 	if caddy_running; then
 		echo "  ✓ Running"
-		docker ps --filter "name=caddy" --format "  Image: {{.Image}}\n  Uptime: {{.Status}}" 2>/dev/null
+		docker ps --filter 'name=^caddy$' --format "  Image: {{.Image}}\n  Uptime: {{.Status}}" 2>/dev/null
 	else
 		echo "  ✗ Not running"
 	fi
@@ -454,7 +689,7 @@ cmd_status() {
 	echo ""
 
 	echo "Firewall (UFW):"
-	if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
+	if command -v ufw &>/dev/null && ufw status | grep -q "^Status: active"; then
 		echo "  ✓ Active"
 	else
 		echo "  ✗ Inactive or not installed"
@@ -505,11 +740,11 @@ cmd_reload() {
 	log_info "Reloading Caddy configuration..."
 
 	if caddy_running; then
-		if ! docker exec caddy caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
+		if ! caddy_validate; then
 			log_error "Caddyfile validation failed — not reloading"
 			return 1
 		fi
-		if docker exec caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null; then
+		if caddy_reload; then
 			log_success "Caddy configuration reloaded"
 		else
 			log_error "Reload failed"
@@ -576,33 +811,16 @@ cmd_update() {
 			docker image prune -f
 
 			log_success "Caddy updated to latest version"
-			docker ps --filter "name=caddy" --format "Image: {{.Image}}"
+			docker ps --filter 'name=^caddy$' --format "Image: {{.Image}}"
 			;;
 		caddyfile)
-			log_info "Regenerating global Caddyfile from template..."
-
-			generate_caddyfile > "$CONFIG_DIR/Caddyfile.new"
-			chmod 644 "$CONFIG_DIR/Caddyfile.new"
-			chown root:root "$CONFIG_DIR/Caddyfile.new"
-
-			if caddy_running; then
-				# Swap in new file, validate, roll back on failure
-				cp "$CONFIG_DIR/Caddyfile" "$CONFIG_DIR/Caddyfile.bak"
-				mv "$CONFIG_DIR/Caddyfile.new" "$CONFIG_DIR/Caddyfile"
-
-				if docker exec caddy caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
-					docker exec caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
-					rm -f "$CONFIG_DIR/Caddyfile.bak"
-					log_success "Global Caddyfile updated and Caddy reloaded"
-				else
-					mv "$CONFIG_DIR/Caddyfile.bak" "$CONFIG_DIR/Caddyfile"
-					log_error "New Caddyfile validation failed — rolled back to previous config"
-					return 1
-				fi
-			else
-				mv "$CONFIG_DIR/Caddyfile.new" "$CONFIG_DIR/Caddyfile"
-				log_success "Global Caddyfile updated (Caddy not running — start it to apply)"
+			if caddy_running && caddy_legacy_mount; then
+				log_error "This container predates the current setup. Run '$SCRIPT_NAME upgrade' instead."
+				return 1
 			fi
+
+			log_info "Updating global Caddyfile from template..."
+			ensure_caddy_config caddyfile
 			;;
 		setup)
 			log_info "Updating setup script from GitHub..."
@@ -626,6 +844,7 @@ cmd_update() {
 				mv "$CONFIG_DIR/setup.sh.new" "$CONFIG_DIR/setup.sh"
 				chown root:root "$CONFIG_DIR/setup.sh"
 				log_success "Setup script updated"
+				log_info "Run '$SCRIPT_NAME upgrade --check' to see if the server configuration needs updating"
 			else
 				log_error "Failed to download setup script"
 				rm -f "$CONFIG_DIR/setup.sh.new"
@@ -667,6 +886,431 @@ cmd_ssl_status() {
 }
 
 #-------------------------------------------------------------------------------
+# Setup Steps
+#-------------------------------------------------------------------------------
+# Each step compares the server with what this script sets up and fixes only
+# the differences, so the same steps serve both the initial setup and upgrades
+# of servers set up by any earlier version. With CHECK_ONLY=1 a step reports
+# what it would change and touches nothing.
+
+ensure_packages() {
+	local packages=(
+		apt-transport-https
+		bash-completion
+		ca-certificates
+		curl
+		gnupg
+		lsb-release
+		rsync
+		ufw
+		unattended-upgrades
+		vnstat
+		apt-listchanges
+	)
+	local missing=()
+	local package
+
+	for package in "${packages[@]}"; do
+		if [[ "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)" != "installed" ]]; then
+			missing+=("$package")
+		fi
+	done
+
+	if [[ ${#missing[@]} -eq 0 ]]; then
+		return 0
+	fi
+
+	if (( CHECK_ONLY )); then
+		drift "Packages not installed: ${missing[*]}"
+		return 0
+	fi
+
+	log_info "Installing packages: ${missing[*]}"
+	apt-get update
+	DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+}
+
+ensure_docker() {
+	if command -v docker &> /dev/null; then
+		return 0
+	fi
+
+	if (( CHECK_ONLY )); then
+		drift "Docker is not installed"
+		return 0
+	fi
+
+	log_info "Installing Docker..."
+
+	# Install Docker using the official apt repository
+	install -m 0755 -d /etc/apt/keyrings
+	curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+	chmod a+r /etc/apt/keyrings/docker.asc
+
+	echo \
+		"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+		$(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+		tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+	apt-get update
+	DEBIAN_FRONTEND=noninteractive apt-get install -y \
+		docker-ce \
+		docker-ce-cli \
+		containerd.io \
+		docker-buildx-plugin \
+		docker-compose-plugin
+
+	systemctl enable docker
+	systemctl start docker
+
+	log_success "Docker installed: $(docker --version)"
+}
+
+ensure_firewall() {
+	local rules=("22/tcp:SSH" "80/tcp:HTTP" "443/tcp:HTTPS" "443/udp:HTTP/3")
+	local rule port comment
+
+	# A new server starts from a clean rule set. An existing one may have rules
+	# of its own, so there only what's missing is added.
+	if (( FRESH_INSTALL )); then
+		log_info "Configuring firewall..."
+
+		ufw --force reset
+		ufw default deny incoming
+		ufw default allow outgoing
+
+		for rule in "${rules[@]}"; do
+			ufw allow "${rule%%:*}" comment "${rule#*:}"
+		done
+
+		ufw --force enable
+
+		log_success "Firewall configured"
+		ufw status
+		return 0
+	fi
+
+	local status=""
+	if command -v ufw &> /dev/null; then
+		status="$(ufw status 2>/dev/null || true)"
+	fi
+
+	for rule in "${rules[@]}"; do
+		port="${rule%%:*}"
+		comment="${rule#*:}"
+
+		if grep -qE "^${port}[[:space:]]+ALLOW" <<< "$status"; then
+			continue
+		fi
+
+		if (( CHECK_ONLY )); then
+			drift "Firewall rule missing: allow $port ($comment)"
+		else
+			ufw allow "$port" comment "$comment"
+		fi
+	done
+
+	if ! grep -q "^Status: active" <<< "$status"; then
+		if (( CHECK_ONLY )); then
+			drift "Firewall is not active (it will be enabled, denying other incoming traffic)"
+		else
+			ufw default deny incoming
+			ufw default allow outgoing
+			ufw --force enable
+			log_success "Firewall enabled"
+		fi
+	fi
+}
+
+ensure_deploy_user() {
+	if ! id "$DEPLOY_USER" &> /dev/null; then
+		if (( CHECK_ONLY )); then
+			drift "Deploy user '$DEPLOY_USER' does not exist"
+		else
+			log_info "Creating deploy user (content deployment only)..."
+			adduser --disabled-password --gecos "" "$DEPLOY_USER"
+
+			mkdir -p "/home/$DEPLOY_USER/.ssh"
+			if [[ -f /root/.ssh/authorized_keys ]]; then
+				cp /root/.ssh/authorized_keys "/home/$DEPLOY_USER/.ssh/"
+				chown -R "$DEPLOY_USER:$DEPLOY_USER" "/home/$DEPLOY_USER/.ssh"
+				chmod 700 "/home/$DEPLOY_USER/.ssh"
+				chmod 600 "/home/$DEPLOY_USER/.ssh/authorized_keys"
+			fi
+
+			log_success "Deploy user created"
+		fi
+	fi
+
+	# Restricted shell for deploy user (rsync-only). Installed before the SSH
+	# configuration that forces it, so deploys keep working in between.
+	sync_file /usr/local/bin/deploy-shell 755 generate_deploy_shell || true
+}
+
+ensure_ssh() {
+	local conf="/etc/ssh/sshd_config.d/99-hardened.conf"
+	local previous="$WORK_DIR/sshd-previous.conf"
+
+	rm -f "$previous"
+	if [[ -f "$conf" ]]; then
+		cp -p "$conf" "$previous"
+	fi
+
+	if ! sync_file "$conf" 644 generate_sshd_config; then
+		return 0
+	fi
+
+	if (( CHECK_ONLY )); then
+		return 0
+	fi
+
+	mkdir -p /run/sshd
+
+	if sshd -t; then
+		systemctl reload ssh 2>/dev/null || systemctl restart ssh
+		log_success "SSH hardened successfully"
+	else
+		log_error "SSH configuration error, reverting..."
+		if [[ -f "$previous" ]]; then
+			cat "$previous" > "$conf"
+		else
+			rm -f "$conf"
+		fi
+		exit 1
+	fi
+}
+
+ensure_auto_updates() {
+	sync_file /etc/apt/apt.conf.d/20auto-upgrades 644 generate_auto_upgrades || true
+	sync_file /etc/apt/apt.conf.d/50unattended-upgrades 644 generate_unattended_upgrades || true
+
+	if ! systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
+		if (( CHECK_ONLY )); then
+			drift "Automatic security updates are not enabled"
+		else
+			systemctl enable unattended-upgrades
+			log_success "Automatic updates enabled"
+		fi
+	fi
+}
+
+ensure_shell() {
+	# Up/Down arrows search history by the typed prefix (both normal and
+	# application cursor key modes)
+	if grep -q "# setup.sh: history prefix search" /etc/inputrc 2>/dev/null; then
+		return 0
+	fi
+
+	if (( CHECK_ONLY )); then
+		drift "Shell history prefix search is not configured in /etc/inputrc"
+		return 0
+	fi
+
+	cat >> /etc/inputrc << 'EOF'
+
+# setup.sh: history prefix search
+"\e[A": history-search-backward
+"\e[B": history-search-forward
+"\eOA": history-search-backward
+"\eOB": history-search-forward
+EOF
+
+	log_success "Shell history search configured"
+}
+
+ensure_directories() {
+	local dir
+
+	# Not recursive: public/ directories inside sites belong to the deploy user
+	for dir in "$CONFIG_DIR" "$SITES_DIR" /var/log/caddy; do
+		if [[ -d "$dir" ]]; then
+			continue
+		fi
+
+		if (( CHECK_ONLY )); then
+			drift "$dir is missing"
+		else
+			mkdir -p "$dir"
+			chown root:root "$dir"
+			log_success "Created $dir"
+		fi
+	done
+
+	# Global 'setup' command (root only)
+	if [[ "$(readlink /usr/local/bin/setup 2>/dev/null || true)" != "$CONFIG_DIR/setup.sh" ]]; then
+		if (( CHECK_ONLY )); then
+			drift "/usr/local/bin/setup does not point to $CONFIG_DIR/setup.sh"
+		else
+			ln -sf "$CONFIG_DIR/setup.sh" /usr/local/bin/setup
+		fi
+	fi
+}
+
+# Bring the Caddy configuration in line with the templates and apply it.
+#   ensure_caddy_config [all|caddyfile]
+# 'caddyfile' leaves docker-compose.yml alone. New files are validated before
+# Caddy sees them and rolled back if they don't pass.
+ensure_caddy_config() {
+	local scope="${1:-all}"
+	local compose="$CONFIG_DIR/docker-compose.yml"
+	local caddyfile="$CONFIG_DIR/Caddyfile"
+	local caddyfile_local="$CONFIG_DIR/Caddyfile.local"
+	local compose_changed=0
+	local caddyfile_changed=0
+	local file
+
+	# Created once, then left to the user
+	if [[ ! -f "$caddyfile_local" ]]; then
+		if (( CHECK_ONLY )); then
+			drift "$caddyfile_local is missing"
+		else
+			generate_caddyfile_local > "$caddyfile_local"
+			chmod 644 "$caddyfile_local"
+			chown root:root "$caddyfile_local"
+			log_success "Created $caddyfile_local"
+		fi
+	fi
+
+	if [[ "$scope" == "all" ]] && sync_file "$compose" 644 generate_docker_compose backup; then
+		compose_changed=1
+	fi
+
+	if sync_file "$caddyfile" 644 generate_caddyfile backup; then
+		caddyfile_changed=1
+	fi
+
+	if (( CHECK_ONLY )); then
+		return 0
+	fi
+
+	if (( ! compose_changed && ! caddyfile_changed )); then
+		if [[ "$scope" == "caddyfile" ]]; then
+			log_info "Global Caddyfile is already up to date"
+		fi
+		return 0
+	fi
+
+	# Nothing to validate against or apply to on a server that's still being set up
+	if ! is_setup_complete; then
+		return 0
+	fi
+
+	if ! caddy_validate; then
+		for file in "$compose" "$caddyfile"; do
+			if [[ -f "$file.bak.$STAMP" ]]; then
+				cat "$file.bak.$STAMP" > "$file"
+			fi
+		done
+		log_error "New Caddy configuration failed validation — rolled back to the previous files"
+		return 1
+	fi
+
+	if ! caddy_running; then
+		log_info "Caddy is not running — start it to apply: $SCRIPT_NAME restart"
+		return 0
+	fi
+
+	# Changes to docker-compose.yml only take effect in a new container, and a
+	# container with the old single-file mount can't see the new Caddyfile
+	if (( compose_changed )) || caddy_legacy_mount; then
+		log_info "Recreating Caddy container..."
+		(cd "$CONFIG_DIR" && docker compose up -d)
+		log_success "Caddy container recreated"
+	elif caddy_reload; then
+		log_success "Caddy configuration reloaded"
+	else
+		log_error "Reload failed — Caddy is still running the previous configuration"
+		return 1
+	fi
+}
+
+run_setup_steps() {
+	ensure_packages
+	ensure_docker
+	ensure_firewall
+	ensure_deploy_user
+	ensure_ssh
+	ensure_auto_updates
+	ensure_shell
+	ensure_directories
+	ensure_caddy_config
+}
+
+#-------------------------------------------------------------------------------
+# Upgrade
+#-------------------------------------------------------------------------------
+
+cmd_upgrade() {
+	local check_only=0
+	local assume_yes=0
+	local arg
+
+	for arg in "$@"; do
+		case "$arg" in
+			--check) check_only=1 ;;
+			--yes|-y) assume_yes=1 ;;
+			*)
+				log_error "Unknown option: $arg (use '--check' or '--yes')"
+				return 1
+				;;
+		esac
+	done
+
+	if ! is_setup_complete; then
+		log_error "Server has not been set up yet"
+		return 1
+	fi
+
+	check_ubuntu
+
+	log_header "Checking Server Configuration"
+
+	DRIFT_COUNT=0
+	CHECK_ONLY=1
+	run_setup_steps
+	CHECK_ONLY=0
+
+	if (( DRIFT_COUNT == 0 )); then
+		if (( ! check_only )); then
+			write_version
+		fi
+		log_success "Server configuration is up to date"
+		return 0
+	fi
+
+	echo ""
+
+	if (( check_only )); then
+		log_info "$DRIFT_COUNT change(s) pending. Apply with: $SCRIPT_NAME upgrade"
+		return 0
+	fi
+
+	log_warning "Applying $DRIFT_COUNT change(s):"
+	echo "  - Replaced Caddy files are kept as <file>.bak.$STAMP"
+	echo "  - Your changes to the global Caddyfile belong in $CONFIG_DIR/Caddyfile.local"
+	echo "  - Caddy is recreated if docker-compose.yml changes (a few seconds of downtime)"
+	echo "  - If SSH changes, keep this session open until a new login works"
+	echo ""
+
+	if (( ! assume_yes )); then
+		local confirm=""
+		read -rp "Continue? (y/n): " confirm || true
+
+		if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+			log_info "Cancelled."
+			return 0
+		fi
+	fi
+
+	log_header "Upgrading Server Configuration"
+
+	run_setup_steps
+	write_version
+
+	log_success "Server configuration upgraded to version $SCHEMA_VERSION"
+}
+
+#-------------------------------------------------------------------------------
 # Initial Server Setup
 #-------------------------------------------------------------------------------
 
@@ -675,233 +1319,19 @@ do_initial_setup() {
 
 	log_header "Starting Initial Server Setup"
 
-	#---------------------------------------------------------------------------
-	# System Updates
-	#---------------------------------------------------------------------------
-
 	log_info "Updating system packages..."
 	apt-get update
 	DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 	DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y
 
-	#---------------------------------------------------------------------------
-	# Install Essential Packages
-	#---------------------------------------------------------------------------
-
-	log_info "Installing essential packages..."
-	DEBIAN_FRONTEND=noninteractive apt-get install -y \
-		apt-transport-https \
-		bash-completion \
-		ca-certificates \
-		curl \
-		gnupg \
-		lsb-release \
-		rsync \
-		ufw \
-		unattended-upgrades \
-		vnstat \
-		apt-listchanges
-
-	#---------------------------------------------------------------------------
-	# Install Docker
-	#---------------------------------------------------------------------------
-
-	log_info "Installing Docker..."
-
-	if command -v docker &> /dev/null; then
-		log_info "Docker is already installed"
-	else
-		# Install Docker using the official apt repository
-		install -m 0755 -d /etc/apt/keyrings
-		curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-		chmod a+r /etc/apt/keyrings/docker.asc
-
-		echo \
-			"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-			$(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-			tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-		apt-get update
-		DEBIAN_FRONTEND=noninteractive apt-get install -y \
-			docker-ce \
-			docker-ce-cli \
-			containerd.io \
-			docker-buildx-plugin \
-			docker-compose-plugin
-
-		systemctl enable docker
-		systemctl start docker
-	fi
-
-	log_success "Docker installed: $(docker --version)"
-
-	#---------------------------------------------------------------------------
-	# Configure Firewall (UFW)
-	#---------------------------------------------------------------------------
-
-	log_info "Configuring firewall..."
-
-	ufw --force reset
-	ufw default deny incoming
-	ufw default allow outgoing
-
-	ufw allow 22/tcp comment 'SSH'
-	ufw allow 80/tcp comment 'HTTP'
-	ufw allow 443/tcp comment 'HTTPS'
-	ufw allow 443/udp comment 'HTTP/3'
-
-	ufw --force enable
-
-	log_success "Firewall configured"
-	ufw status
-
-	#---------------------------------------------------------------------------
-	# Configure SSH Hardening
-	#---------------------------------------------------------------------------
-
-	log_info "Hardening SSH configuration..."
-
-	cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
-
-	cat > /etc/ssh/sshd_config.d/99-hardened.conf << 'EOF'
-# SSH Hardening Configuration
-PasswordAuthentication no
-PermitEmptyPasswords no
-PermitRootLogin prohibit-password
-PubkeyAuthentication yes
-X11Forwarding no
-MaxAuthTries 3
-LoginGraceTime 30
-ClientAliveInterval 300
-ClientAliveCountMax 2
-Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
-MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
-KexAlgorithms curve25519-sha256@libssh.org,curve25519-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
-
-# Restrict deploy user to rsync only via forced command
-Match User deploy
-	ForceCommand /usr/local/bin/deploy-shell
-	AllowTcpForwarding no
-	PermitTunnel no
-	AllowAgentForwarding no
-EOF
-
-	mkdir -p /run/sshd
-
-	if sshd -t; then
-		systemctl restart ssh
-		log_success "SSH hardened successfully"
-	else
-		log_error "SSH configuration error, reverting..."
-		rm /etc/ssh/sshd_config.d/99-hardened.conf
-		exit 1
-	fi
-
-	#---------------------------------------------------------------------------
-	# Configure Automatic Updates
-	#---------------------------------------------------------------------------
-
-	log_info "Configuring automatic security updates..."
-
-	cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-EOF
-
-	cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
-Unattended-Upgrade::Allowed-Origins {
-    "${distro_id}:${distro_codename}";
-    "${distro_id}:${distro_codename}-security";
-    "${distro_id}ESMApps:${distro_codename}-apps-security";
-    "${distro_id}ESM:${distro_codename}-infra-security";
-};
-
-Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Automatic-Reboot "false";
-EOF
-
-	systemctl enable unattended-upgrades
-	log_success "Automatic updates configured"
-
-	#---------------------------------------------------------------------------
-	# Configure Shell
-	#---------------------------------------------------------------------------
-
-	log_info "Configuring shell history search..."
-
-	# Up/Down arrows search history by the typed prefix (both normal and
-	# application cursor key modes)
-	if ! grep -q "# setup.sh: history prefix search" /etc/inputrc 2>/dev/null; then
-		cat >> /etc/inputrc << 'EOF'
-
-# setup.sh: history prefix search
-"\e[A": history-search-backward
-"\e[B": history-search-forward
-"\eOA": history-search-backward
-"\eOB": history-search-forward
-EOF
-	fi
-
-	log_success "Shell history search configured"
-
-	#---------------------------------------------------------------------------
-	# Create Deploy User
-	#---------------------------------------------------------------------------
-
-	if ! id "$DEPLOY_USER" &>/dev/null; then
-		log_info "Creating deploy user (content deployment only)..."
-		adduser --disabled-password --gecos "" "$DEPLOY_USER"
-
-		mkdir -p "/home/$DEPLOY_USER/.ssh"
-		if [[ -f /root/.ssh/authorized_keys ]]; then
-			cp /root/.ssh/authorized_keys "/home/$DEPLOY_USER/.ssh/"
-			chown -R "$DEPLOY_USER:$DEPLOY_USER" "/home/$DEPLOY_USER/.ssh"
-			chmod 700 "/home/$DEPLOY_USER/.ssh"
-			chmod 600 "/home/$DEPLOY_USER/.ssh/authorized_keys"
-		fi
-
-		log_success "Deploy user created"
-	else
-		log_info "Deploy user already exists"
-	fi
-
-	# Install restricted shell for deploy user (rsync-only)
-	generate_deploy_shell > /usr/local/bin/deploy-shell
-	chmod 755 /usr/local/bin/deploy-shell
-	chown root:root /usr/local/bin/deploy-shell
-
-	# Create symlink for global 'setup' command (root only)
-	ln -sf "$CONFIG_DIR/setup.sh" /usr/local/bin/setup
-
-	#---------------------------------------------------------------------------
-	# Create Directory Structure
-	#---------------------------------------------------------------------------
-
-	log_info "Creating directory structure..."
-
-	mkdir -p "$CONFIG_DIR"
-	mkdir -p "$SITES_DIR"
-	mkdir -p /var/log/caddy
-
-	chown -R root:root "$CONFIG_DIR"
-	chown -R root:root "$SITES_DIR"
-	chown -R root:root /var/log/caddy
-
-	log_success "Directories created"
-
-	#---------------------------------------------------------------------------
-	# Write Configuration Files
-	#---------------------------------------------------------------------------
-
-	log_info "Writing configuration files..."
-
-	generate_caddyfile > "$CONFIG_DIR/Caddyfile"
-	generate_docker_compose > "$CONFIG_DIR/docker-compose.yml"
+	FRESH_INSTALL=1
+	CHECK_ONLY=0
+	run_setup_steps
 
 	# Copy this script to config dir (all config owned by root)
-	cp "$0" "$CONFIG_DIR/setup.sh"
+	if [[ "$(readlink -f "$0")" != "$CONFIG_DIR/setup.sh" ]]; then
+		cp "$0" "$CONFIG_DIR/setup.sh"
+	fi
 	chmod +x "$CONFIG_DIR/setup.sh"
 
 	log_success "Configuration files written to $CONFIG_DIR"
@@ -950,6 +1380,7 @@ EOF
 	#---------------------------------------------------------------------------
 
 	echo "$(date -Iseconds)" > "$SETUP_MARKER"
+	write_version
 
 	#---------------------------------------------------------------------------
 	# Cleanup
@@ -980,6 +1411,7 @@ EOF
 	echo "Directory structure:"
 	echo "  $CONFIG_DIR/"
 	echo "    ├── Caddyfile"
+	echo "    ├── Caddyfile.local"
 	echo "    ├── docker-compose.yml"
 	echo "    └── setup.sh"
 	echo "  $SITES_DIR/<domain>/"
@@ -1020,6 +1452,9 @@ show_menu() {
 
 		echo "Sites: $(get_site_count) configured"
 		echo "Caddy: $(caddy_running && echo 'Running' || echo 'Not running')"
+		if upgrade_pending; then
+			log_warning "Server configuration is outdated — choose 11 to upgrade"
+		fi
 		echo ""
 		echo "Commands:"
 		echo "  1) Add a new site"
@@ -1032,23 +1467,26 @@ show_menu() {
 		echo "  8) Update Caddy image"
 		echo "  9) Update global Caddyfile"
 		echo " 10) Update setup script"
+		echo " 11) Upgrade server configuration"
 		echo "  s) Check SSL certificates"
 		echo "  0) Exit"
 		echo ""
 		read -rp "Choose an option: " choice || true
 
 		case "$choice" in
-			1) cmd_add_site ;;
-			2) cmd_remove_site ;;
-			3) cmd_list_sites ;;
-			4) cmd_status ;;
-			5) cmd_logs ;;
-			6) cmd_reload ;;
-			7) cmd_restart ;;
-			8) cmd_update caddy ;;
-			9) cmd_update caddyfile ;;
-			10) cmd_update setup ;;
-			s|S) cmd_ssl_status ;;
+			# A failed command returns to the menu instead of ending the script
+			1) cmd_add_site || true ;;
+			2) cmd_remove_site || true ;;
+			3) cmd_list_sites || true ;;
+			4) cmd_status || true ;;
+			5) cmd_logs || true ;;
+			6) cmd_reload || true ;;
+			7) cmd_restart || true ;;
+			8) cmd_update caddy || true ;;
+			9) cmd_update caddyfile || true ;;
+			10) cmd_update setup || true ;;
+			11) cmd_upgrade || true ;;
+			s|S) cmd_ssl_status || true ;;
 			0) exit 0 ;;
 			*) log_error "Invalid option" ;;
 		esac
@@ -1066,7 +1504,7 @@ All commands require root access.
 
 Commands:
   (no command)           Interactive menu
-  add [domain] [email]   Add a new site
+  add [domain] [email]   Add a new site (--www or --no-www to skip the prompt)
   remove [domain]        Remove a site
   list                   List all sites
   status                 Show server status
@@ -1076,6 +1514,7 @@ Commands:
   update caddy           Update Caddy image
   update caddyfile       Update global Caddyfile
   update setup           Update setup script
+  upgrade [--check]      Bring server configuration up to date
   ssl                    Check SSL certificates
   help                   Show help
 
@@ -1083,7 +1522,9 @@ Examples:
   setup
   setup add example.com me@example.com
   setup remove example.com
+  setup add blog.example.com me@example.com --no-www
   setup update caddy
+  setup upgrade --check
   setup logs example.com 100
 
 EOF
@@ -1124,6 +1565,10 @@ main() {
 		update)
 			shift
 			cmd_update "$@"
+			;;
+		upgrade)
+			shift
+			cmd_upgrade "$@"
 			;;
 		ssl|certs|certificates)
 			cmd_ssl_status
