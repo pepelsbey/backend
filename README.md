@@ -113,11 +113,13 @@ The global Caddyfile is replaced by the upgrade. If you’ve edited it, move you
 
 ## Deploying your site
 
-The deploy user can only write to `/opt/sites/<domain>/public/` directories:
+The deploy user can only run rsync and only write to `/opt/sites/<domain>/public/` directories:
 
 ```bash
 rsync --archive --verbose --compress --delete --delete-excluded --exclude '.DS_Store' ./dist/ deploy@example.com:/opt/sites/example.com/public/
 ```
+
+Deploy keys live in `/home/deploy/.ssh/authorized_keys`. The file is owned by root, so edit it as root.
 
 ## Configuration
 

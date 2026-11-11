@@ -82,7 +82,7 @@ SCRIPT_URL="https://raw.githubusercontent.com/pepelsbey/backend/refs/heads/main/
 # Version of the server configuration this script produces. Bump it whenever
 # a change needs 'setup upgrade' to reach existing servers. Servers set up
 # before versioning have no version file and count as version 0.
-SCHEMA_VERSION=1
+SCHEMA_VERSION=2
 
 # Run state
 CHECK_ONLY=0     # 1 = report differences without changing anything
@@ -252,12 +252,26 @@ if [[ -z "${SSH_ORIGINAL_COMMAND:-}" ]]; then
 	exit 1
 fi
 
-if [[ "$SSH_ORIGINAL_COMMAND" == rsync\ --server* ]]; then
-	exec $SSH_ORIGINAL_COMMAND
+# Split the command into words without expanding anything in it. Reading
+# without -r drops the backslashes rsync escapes special characters with.
+read -a args <<< "$SSH_ORIGINAL_COMMAND"
+
+if [[ "${args[0]:-}" != "rsync" || "${args[1]:-}" != "--server" ]]; then
+	echo "Only rsync is permitted for this account." >&2
+	exit 1
 fi
 
-echo "Only rsync is permitted for this account."
-exit 1
+# Daemon mode reads a config file that can run arbitrary commands
+for arg in "${args[@]}"; do
+	case "$arg" in
+		--daemon*|--config*)
+			echo "This rsync option is not permitted for this account." >&2
+			exit 1
+			;;
+	esac
+done
+
+exec "${args[@]}"
 DEPLOY_SHELL_EOF
 }
 
@@ -276,14 +290,19 @@ ClientAliveCountMax 2
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 KexAlgorithms curve25519-sha256@libssh.org,curve25519-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+SSHD_CONFIG_EOF
+}
 
+generate_sshd_deploy_config() {
+	cat << SSHD_DEPLOY_CONFIG_EOF
 # Restrict deploy user to rsync only via forced command
-Match User deploy
+Match User $DEPLOY_USER
 	ForceCommand /usr/local/bin/deploy-shell
 	AllowTcpForwarding no
 	PermitTunnel no
 	AllowAgentForwarding no
-SSHD_CONFIG_EOF
+	PermitUserRC no
+SSHD_DEPLOY_CONFIG_EOF
 }
 
 generate_auto_upgrades() {
@@ -1042,40 +1061,121 @@ ensure_deploy_user() {
 		fi
 	fi
 
+	# The home directory belongs to root, so the deploy key can't be used to
+	# plant shell startup files or add more keys. It stays readable: sshd reads
+	# authorized_keys as the deploy user.
+	local home="/home/$DEPLOY_USER"
+
+	if [[ -d "$home" ]] && ! deploy_home_locked "$home"; then
+		if (( CHECK_ONLY )); then
+			drift "$home is writable by '$DEPLOY_USER' (it will be owned by root; keys stay in $home/.ssh/authorized_keys)"
+		else
+			chown -R root:root "$home"
+			chmod 755 "$home"
+			if [[ -d "$home/.ssh" ]]; then
+				chmod 755 "$home/.ssh"
+			fi
+			if [[ -f "$home/.ssh/authorized_keys" ]]; then
+				chmod 644 "$home/.ssh/authorized_keys"
+			fi
+			log_success "Deploy user's home directory locked"
+		fi
+	fi
+
 	# Restricted shell for deploy user (rsync-only). Installed before the SSH
 	# configuration that forces it, so deploys keep working in between.
 	sync_file /usr/local/bin/deploy-shell 755 generate_deploy_shell || true
 }
 
+deploy_home_locked() {
+	local home="$1"
+
+	if [[ -n "$(find "$home" ! -user root -print -quit 2>/dev/null)" ]]; then
+		return 1
+	fi
+	if [[ "$(stat -c %a "$home")" != "755" ]]; then
+		return 1
+	fi
+	if [[ -d "$home/.ssh" && "$(stat -c %a "$home/.ssh")" != "755" ]]; then
+		return 1
+	fi
+	if [[ -f "$home/.ssh/authorized_keys" && "$(stat -c %a "$home/.ssh/authorized_keys")" != "644" ]]; then
+		return 1
+	fi
+	return 0
+}
+
+# Check what sshd will actually apply, since a setting can be overridden by
+# another file in sshd_config.d
+ssh_config_effective() {
+	local connection="host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22"
+
+	if ! sshd -T 2>/dev/null | grep -qix "passwordauthentication no"; then
+		log_error "Password authentication is still enabled by another SSH configuration file"
+		return 1
+	fi
+	if ! sshd -T -C "user=$DEPLOY_USER,$connection" 2>/dev/null | grep -qix "forcecommand /usr/local/bin/deploy-shell"; then
+		log_error "The deploy user is not restricted to the deploy shell"
+		return 1
+	fi
+	if ! sshd -T -C "user=root,$connection" 2>/dev/null | grep -qix "forcecommand none"; then
+		log_error "The deploy restrictions apply to root as well"
+		return 1
+	fi
+	return 0
+}
+
 ensure_ssh() {
-	local conf="/etc/ssh/sshd_config.d/99-hardened.conf"
-	local previous="$WORK_DIR/sshd-previous.conf"
+	local dir="/etc/ssh/sshd_config.d"
+	# sshd uses the first value it reads for each setting, so the hardening has
+	# to sort before files like 50-cloud-init.conf. Match blocks go last.
+	local hardened="$dir/00-hardened.conf"
+	local deploy="$dir/99-deploy.conf"
+	local legacy="$dir/99-hardened.conf"
+	local previous="$WORK_DIR/sshd_config.d"
+	local changed=0
+	local file
 
-	rm -f "$previous"
-	if [[ -f "$conf" ]]; then
-		cp -p "$conf" "$previous"
+	rm -rf "$previous"
+	mkdir -p "$previous"
+	for file in "$hardened" "$deploy" "$legacy"; do
+		if [[ -f "$file" ]]; then
+			cp -p "$file" "$previous/"
+		fi
+	done
+
+	if sync_file "$hardened" 644 generate_sshd_config; then
+		changed=1
+	fi
+	if sync_file "$deploy" 644 generate_sshd_deploy_config; then
+		changed=1
+	fi
+	if [[ -f "$legacy" ]]; then
+		changed=1
+		if (( CHECK_ONLY )); then
+			drift "$legacy is replaced by the two files above"
+		else
+			rm -f "$legacy"
+		fi
 	fi
 
-	if ! sync_file "$conf" 644 generate_sshd_config; then
-		return 0
-	fi
-
-	if (( CHECK_ONLY )); then
+	if (( CHECK_ONLY || ! changed )); then
 		return 0
 	fi
 
 	mkdir -p /run/sshd
 
-	if sshd -t; then
+	if sshd -t && ssh_config_effective; then
 		systemctl reload ssh 2>/dev/null || systemctl restart ssh
 		log_success "SSH hardened successfully"
 	else
 		log_error "SSH configuration error, reverting..."
-		if [[ -f "$previous" ]]; then
-			cat "$previous" > "$conf"
-		else
-			rm -f "$conf"
-		fi
+		rm -f "$hardened" "$deploy" "$legacy"
+		for file in "$previous"/*; do
+			if [[ -f "$file" ]]; then
+				cp -p "$file" "$dir/"
+			fi
+		done
 		exit 1
 	fi
 }
