@@ -82,7 +82,7 @@ SCRIPT_URL="https://raw.githubusercontent.com/pepelsbey/backend/refs/heads/main/
 # Version of the server configuration this script produces. Bump it whenever
 # a change needs 'setup upgrade' to reach existing servers. Servers set up
 # before versioning have no version file and count as version 0.
-SCHEMA_VERSION=2
+SCHEMA_VERSION=3
 
 # Run state
 CHECK_ONLY=0     # 1 = report differences without changing anything
@@ -101,6 +101,7 @@ services:
     image: ${CADDY_IMAGE}
     container_name: caddy
     restart: unless-stopped
+    stop_grace_period: 3s
     ports:
       - "80:80"
       - "443:443"
@@ -147,7 +148,8 @@ generate_caddyfile() {
 	# Compression (fallback for non-precompressed files)
 	encode zstd gzip
 
-	# Security headers
+	# Security headers. Removing a header defers its whole block until the
+	# response is written, which error pages skip, so -Server stays separate.
 	header {
 		X-Frame-Options "SAMEORIGIN"
 		X-Content-Type-Options "nosniff"
@@ -155,8 +157,11 @@ generate_caddyfile() {
 		Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
 		Cross-Origin-Resource-Policy "same-origin"
 		Cross-Origin-Opener-Policy "same-origin"
-		-Server
 	}
+	header -Server
+
+	# Cache headers are deferred (>), so a missing file isn't cached like a
+	# real one: error pages skip deferred headers.
 
 	# Cache static assets
 	@static {
@@ -165,11 +170,11 @@ generate_caddyfile() {
 		path *.woff *.woff2
 		path *.mp3
 	}
-	header @static Cache-Control "public, max-age=31536000, immutable"
+	header @static >Cache-Control "public, max-age=31536000, immutable"
 
-	# Cache HTML with revalidation
-	@html path *.html
-	header @html Cache-Control "public, max-age=3600, must-revalidate"
+	# Cache pages with revalidation, including directory indexes
+	@html path *.html */
+	header @html >Cache-Control "public, max-age=3600, must-revalidate"
 
 	log {
 		output file /var/log/caddy/{args[0]}.log {
@@ -313,7 +318,18 @@ APT::Periodic::AutocleanInterval "7";
 AUTO_UPGRADES_EOF
 }
 
-generate_unattended_upgrades() {
+generate_unattended_upgrades_local() {
+	cat << 'UNATTENDED_UPGRADES_LOCAL_EOF'
+// Managed by setup.sh. Overrides the packaged 50unattended-upgrades.
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+UNATTENDED_UPGRADES_LOCAL_EOF
+}
+
+# What earlier versions wrote over the packaged 50unattended-upgrades. Only
+# used to recognize that file on existing servers.
+generate_unattended_upgrades_legacy() {
 	cat << 'UNATTENDED_UPGRADES_EOF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}";
@@ -347,7 +363,8 @@ list_sites() {
 	if [[ -d "$SITES_DIR" ]] && [[ -n "$(ls -A "$SITES_DIR" 2>/dev/null)" ]]; then
 		for site in "$SITES_DIR"/*/; do
 			if [[ -d "$site" ]]; then
-				local domain=$(basename "$site")
+				local domain
+				domain="$(basename "$site")"
 				local has_content=""
 				if [[ -n "$(ls -A "$site/public" 2>/dev/null)" ]]; then
 					has_content=" (has content)"
@@ -707,6 +724,17 @@ cmd_status() {
 	echo "  Logs:   $(du -sh /var/log/caddy 2>/dev/null | cut -f1 || echo 'N/A')"
 	echo ""
 
+	echo "System Updates:"
+	if [[ -f /var/run/reboot-required ]]; then
+		echo "  ! Reboot required to finish installing updates"
+		if [[ -s /var/run/reboot-required.pkgs ]]; then
+			echo "    Packages: $(sort -u /var/run/reboot-required.pkgs | tr '\n' ' ')"
+		fi
+	else
+		echo "  ✓ No reboot required"
+	fi
+	echo ""
+
 	echo "Firewall (UFW):"
 	if command -v ufw &>/dev/null && ufw status | grep -q "^Status: active"; then
 		echo "  ✓ Active"
@@ -887,14 +915,17 @@ cmd_ssl_status() {
 
 	for site in "$SITES_DIR"/*/; do
 		if [[ -d "$site" ]]; then
-			local domain=$(basename "$site")
+			local domain
+			domain="$(basename "$site")"
 			echo -n "  $domain: "
 
 			# Try to get certificate info
-			local cert_info=$(echo | timeout 5 openssl s_client -servername "$domain" -connect "$domain:443" 2>/dev/null | openssl x509 -noout -dates 2>/dev/null)
+			local cert_info
+			cert_info="$(echo | timeout 5 openssl s_client -servername "$domain" -connect "$domain:443" 2>/dev/null | openssl x509 -noout -dates 2>/dev/null || true)"
 
 			if [[ -n "$cert_info" ]]; then
-				local expiry=$(echo "$cert_info" | grep "notAfter" | cut -d= -f2)
+				local expiry
+				expiry="$(echo "$cert_info" | grep "notAfter" | cut -d= -f2)"
 				echo "Valid until $expiry"
 			else
 				echo "Unable to check (DNS may not be configured yet)"
@@ -1182,7 +1213,22 @@ ensure_ssh() {
 
 ensure_auto_updates() {
 	sync_file /etc/apt/apt.conf.d/20auto-upgrades 644 generate_auto_upgrades || true
-	sync_file /etc/apt/apt.conf.d/50unattended-upgrades 644 generate_unattended_upgrades || true
+	sync_file /etc/apt/apt.conf.d/52unattended-upgrades-local 644 generate_unattended_upgrades_local || true
+
+	# Earlier versions replaced the packaged 50unattended-upgrades, which then
+	# stops receiving updates from the package. Put the packaged one back,
+	# unless the file has been edited since.
+	local packaged="/usr/share/unattended-upgrades/50unattended-upgrades"
+	local installed="/etc/apt/apt.conf.d/50unattended-upgrades"
+
+	if [[ -f "$packaged" && -f "$installed" ]] && generate_unattended_upgrades_legacy | cmp -s - "$installed"; then
+		if (( CHECK_ONLY )); then
+			drift "$installed was replaced by an earlier setup (the packaged version will be restored)"
+		else
+			cat "$packaged" > "$installed"
+			log_success "Restored packaged $installed"
+		fi
+	fi
 
 	if ! systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
 		if (( CHECK_ONLY )); then
@@ -1479,7 +1525,7 @@ do_initial_setup() {
 	# Mark Setup as Complete
 	#---------------------------------------------------------------------------
 
-	echo "$(date -Iseconds)" > "$SETUP_MARKER"
+	date -Iseconds > "$SETUP_MARKER"
 	write_version
 
 	#---------------------------------------------------------------------------

@@ -6,6 +6,8 @@ A multi-site static web server using Docker and Caddy.
 
 `setup.sh` — unified server setup and management script.
 
+The script is checked with [ShellCheck](https://www.shellcheck.net/) on every push: `shellcheck --severity=warning setup.sh`.
+
 ## Server structure
 
 ```
